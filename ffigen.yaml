@@ -1,0 +1,28 @@
+output: 'lib/src/ffi/tw_bindings.dart'
+name: 'TWBindings'
+description: 'Raw FFI bindings to TrustWalletCore C API'
+headers:
+  entry-points:
+    - '../wallet-core-native/include/TrustWalletCore/TWBase.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWString.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWData.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWHash.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWMnemonic.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWHDWallet.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWPrivateKey.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWPublicKey.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWAnyAddress.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWAnySigner.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWCoinType.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWCurve.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWPublicKeyType.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWPurpose.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWDerivation.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWDerivationPath.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWHDVersion.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWBase58.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWBase64.h'
+    - '../wallet-core-native/include/TrustWalletCore/TWBech32.h'
+  include-directives:
+    - '../wallet-core-native/include/TrustWalletCore/*.h'
+silence-enum-warning: true
