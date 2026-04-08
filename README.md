@@ -48,7 +48,7 @@ trezor-crypto       (trezor-crypto/)      ← форк Trezor — криптог
 
 ```bash
 cd /Users/nvsces/source/dart/core
-git clone --depth 1 https://github.com/trustwallet/wallet-core.git wallet-core-native
+git clone --depth 1 git@github.com:nvsces/wallet-core.git wallet-core-native
 cd wallet-core-native
 ```
 
