@@ -16,6 +16,7 @@ import 'package:redo_wallet_core/src/ffi/tw_ethereum_msg_ffi.dart';
 import 'package:redo_wallet_core/src/ffi/tw_stored_key_ffi.dart';
 import 'package:redo_wallet_core/src/ffi/tw_string_ffi.dart';
 import 'package:redo_wallet_core/src/ffi/tw_ton_address_ffi.dart';
+import 'package:redo_wallet_core/src/ffi/tw_ton_mnemonic_ffi.dart';
 
 /// TWCoinType enum — основные монеты.
 /// Полный список в wallet-core: include/TrustWalletCore/TWCoinType.h
@@ -48,6 +49,7 @@ class WalletCoreAPI {
   late final TWStoredKeyFFI _storedKeyFFI;
   late final TWEthereumMessageSignerFFI _ethMsgFFI;
   late final TWTONAddressConverterFFI _tonAddressFFI;
+  late final TWTONMnemonicFFI _tonMnemonicFFI;
 
   WalletCoreAPI([String? libraryPath]) : _lib = loadTWLibrary(libraryPath) {
     _init();
@@ -72,6 +74,7 @@ class WalletCoreAPI {
     _storedKeyFFI = TWStoredKeyFFI(_lib);
     _ethMsgFFI = TWEthereumMessageSignerFFI(_lib);
     _tonAddressFFI = TWTONAddressConverterFFI(_lib);
+    _tonMnemonicFFI = TWTONMnemonicFFI(_lib);
   }
 
   // ── Hash ──
@@ -340,6 +343,42 @@ class WalletCoreAPI {
     }
   }
 
+  // ── TON Mnemonic ──
+
+  /// Derives a TON ed25519 keypair from a mnemonic on a native
+  /// background thread, byte-for-byte compatible with the `tonutils`
+  /// package's `Mnemonic.toKeyPair`. The 100k-iter PBKDF2 (~2.5s on
+  /// iPhone) does **not** block the calling Dart isolate.
+  ///
+  /// Returns a `(publicKey: 32 bytes, privateKey: 64 bytes)` record.
+  /// `privateKey` is in NaCl secret key layout (`seed || publicKey`),
+  /// matching what `pinenacl.SigningKey(seed: …).toUint8List()` returns.
+  Future<({Uint8List publicKey, Uint8List privateKey})> tonMnemonicToKeyPairAsync(
+    String mnemonic, {
+    String password = '',
+  }) async {
+    // Re-use the dylib-wide Dart Native API DL initialization that the
+    // HDWallet async path performs lazily — both APIs share the same
+    // global function-pointer table inside the dylib.
+    _hdWalletFFI.ensureDartApiDLInitialized();
+
+    final mnemonicStr = TWStringWrapper.fromString(_stringFFI, mnemonic);
+    final passStr = TWStringWrapper.fromString(_stringFFI, password);
+    try {
+      final secretKey = await _tonMnemonicFFI.toKeyPairAsync(
+        mnemonicStr.pointer,
+        passStr.pointer,
+      );
+      // Layout: bytes[0..32] = seed, bytes[32..64] = ed25519 pubkey.
+      // pinenacl exposes the full 64-byte buffer as the "private key",
+      // so we mirror that here.
+      final publicKey = Uint8List.fromList(secretKey.sublist(32, 64));
+      return (publicKey: publicKey, privateKey: secretKey);
+    } finally {
+      mnemonicStr.delete();
+      passStr.delete();
+    }
+  }
 }
 
 /// HD-кошелёк — обёртка над TWHDWallet*.
