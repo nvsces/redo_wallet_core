@@ -308,6 +308,38 @@ class WalletCoreAPI {
       passStr.delete();
     }
   }
+
+  /// Async version of [hdWalletCreate]. The heavy work (entropy generation
+  /// + PBKDF2 seed derivation) runs on a native std::thread inside the
+  /// dylib, so the calling Dart isolate's UI/event loop stays responsive.
+  ///
+  /// All subsequent getter calls on the returned [HDWallet] are still
+  /// synchronous — derivation of address/private key is fast.
+  Future<HDWallet> hdWalletCreateAsync({int strength = 128, String passphrase = ''}) async {
+    final passStr = TWStringWrapper.fromString(_stringFFI, passphrase);
+    try {
+      final ptr = await _hdWalletFFI.createAsync(strength, passStr.pointer);
+      return HDWallet._(this, ptr);
+    } finally {
+      passStr.delete();
+    }
+  }
+
+  /// Async version of [hdWalletFromMnemonic]. PBKDF2 seed derivation
+  /// (the slow part of mnemonic import) runs on a native background
+  /// thread.
+  Future<HDWallet> hdWalletFromMnemonicAsync(String mnemonic, {String passphrase = ''}) async {
+    final mnemonicStr = TWStringWrapper.fromString(_stringFFI, mnemonic);
+    final passStr = TWStringWrapper.fromString(_stringFFI, passphrase);
+    try {
+      final ptr = await _hdWalletFFI.createWithMnemonicAsync(mnemonicStr.pointer, passStr.pointer);
+      return HDWallet._(this, ptr);
+    } finally {
+      mnemonicStr.delete();
+      passStr.delete();
+    }
+  }
+
 }
 
 /// HD-кошелёк — обёртка над TWHDWallet*.
