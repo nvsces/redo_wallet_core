@@ -1,248 +1,334 @@
-# wallet_core
+# redo_wallet_core
 
-Dart FFI биндинги к [Trust Wallet Core](https://github.com/trustwallet/wallet-core) — C++ библиотеке криптографии для 130+ блокчейнов.
+Dart FFI bindings to [Trust Wallet Core](https://github.com/trustwallet/wallet-core) — the production-grade C++/Rust cryptography library that powers Trust Wallet and supports 130+ blockchains.
 
-Вместо того чтобы переписывать криптографию на Dart (небезопасно и медленно), мы используем проверенный C++/Rust код через `dart:ffi`.
+Instead of re-implementing crypto in Dart (slow and unsafe), this package loads the audited native library through `dart:ffi` and exposes a small, idiomatic Dart API on top of it: HD wallets, mnemonics, address derivation, transaction signing, hashing, and a few chain-specific helpers (TON, Ethereum messages, keystore v3).
 
-## Что работает
+> **Status:** alpha. The pure-Dart API is stable enough for the sibling [redo_wallet_provider](../redo_wallet_provider) and [redo_wallet_flutter](../redo_wallet_flutter) packages, but the public surface may still change.
+
+## Features
+
+- HD wallet creation / restore (BIP39, 12 or 24 words), with **async** variants that run PBKDF2 on a native background thread so the Dart isolate stays responsive.
+- Address & private key derivation for any `TWCoinType` (Bitcoin, Ethereum, Solana, TON, Cosmos, Tron, Litecoin, Dogecoin, Polkadot, Cardano, …).
+- Transaction signing through `TWAnySigner` (protobuf in / protobuf out).
+- Address validation and canonical-format normalization (`TWAnyAddress`).
+- Hashing primitives — SHA-256, SHA-512, Keccak-256, RIPEMD-160, double SHA-256, SHA-256+RIPEMD.
+- Encrypted keystore (`TWStoredKey`) — import / export Ethereum keystore v3, save / load from disk, decrypt mnemonics.
+- Ethereum message signer — `personal_sign` (EIP-191) and typed-data (EIP-712).
+- TON helpers — bounceable / non-bounceable / testnet address conversion, and an **async** mnemonic→keypair derivation that is byte-for-byte compatible with the `tonutils` package.
+- Coin metadata — symbol, decimals, name, slip44 id, explorer URLs.
+
+## Requirements
+
+- Dart SDK `^3.10.4`.
+- macOS host for the bundled `lib/libTrustWalletCore.dylib`. Pre-built binaries for iOS / Android / Linux are not yet shipped — see [Building the native library](#building-the-native-library) below.
+
+## Installation
+
+This package is not (yet) on pub.dev. Add it as a path or git dependency:
+
+```yaml
+dependencies:
+  redo_wallet_core:
+    path: ../redo_wallet_core
+```
+
+## Quick start
 
 ```dart
-final api = WalletCoreAPI();
+import 'package:redo_wallet_core/redo_wallet_core.dart';
 
-// Хеширование (нативный C++ trezor-crypto)
-api.hashSHA256(data);
-api.hashKeccak256(data);
+void main() async {
+  final api = WalletCoreAPI();
 
-// BIP39 мнемоника
-api.mnemonicIsValid('abandon abandon ... about'); // true
+  // 1. Create a fresh 24-word HD wallet (off the main isolate).
+  final wallet = await api.hdWalletCreateAsync(strength: 256);
+  print(wallet.mnemonic);
 
-// HD-кошелёк — создание и восстановление
-final wallet = api.hdWalletCreate(strength: 128); // 12 слов
-wallet.mnemonic;                                   // "word1 word2 ..."
-wallet.getAddressForCoin(TWCoinType.ethereum);     // "0x..."
-wallet.getAddressForCoin(TWCoinType.bitcoin);      // "bc1q..."
-wallet.getAddressForCoin(TWCoinType.solana);       // "base58..."
-wallet.getPrivateKeyForCoin(TWCoinType.ethereum);  // Uint8List
-wallet.delete();                                   // освобождаем нативную память
+  // 2. Derive addresses for any supported coin.
+  print(wallet.getAddressForCoin(TWCoinType.bitcoin));   // bc1q...
+  print(wallet.getAddressForCoin(TWCoinType.ethereum));  // 0x...
+  print(wallet.getAddressForCoin(TWCoinType.solana));    // base58...
+  print(wallet.getAddressForCoin(TWCoinType.ton));       // raw form
+
+  // 3. Convert a TON address to user-friendly form.
+  final ton = wallet.getAddressForCoin(TWCoinType.ton);
+  print(api.tonAddressToUserFriendly(ton, bounceable: false));
+
+  // 4. Validate an address.
+  print(api.addressIsValid('0x0000000000000000000000000000000000000000',
+      TWCoinType.ethereum)); // true
+
+  // 5. Hash some data with Keccak-256.
+  final digest = api.hashKeccak256(Uint8List.fromList('hello'.codeUnits));
+
+  // 6. Always release the native handle when you're done with the wallet.
+  wallet.delete();
+}
 ```
 
-## Архитектура
-
-```
-Dart API            (lib/src/core/)       ← WalletCoreAPI, HDWallet
-    ↓
-FFI Bindings        (lib/src/ffi/)        ← lookupFunction к dartTW* символам
-    ↓
-tw_exports.c        (build/)              ← visibility-обёртки (см. ниже почему)
-    ↓
-C Interface         (include/TW*.h)       ← strict C ABI wallet-core
-    ↓
-C++ Core + Rust     (src/, rust/)         ← secp256k1, ed25519, BIP32, 130+ блокчейнов
-    ↓
-trezor-crypto       (trezor-crypto/)      ← форк Trezor — криптографические примитивы
-```
-
-## Как мы это собирали — пошаговое руководство
-
-### Шаг 1: Клонируем wallet-core
+A more complete tour — coin metadata, keystore v3, address validation, hash demos — lives in [example/full_demo.dart](example/full_demo.dart). Run it with:
 
 ```bash
-cd /Users/nvsces/source/dart/core
-git clone --depth 1 git@github.com:nvsces/wallet-core.git wallet-core-native
-cd wallet-core-native
+dart run example/full_demo.dart
 ```
 
-### Шаг 2: Устанавливаем системные зависимости
+## API tour
 
-```bash
-brew install boost ninja cmake
-cargo install cbindgen   # для генерации Rust→C хедеров
+### `WalletCoreAPI`
+
+Single entry point. Loads the dylib once and lazily wires up every FFI module.
+
+```dart
+final api = WalletCoreAPI();                    // looks up the dylib next to the package
+final api = WalletCoreAPI('/path/to/lib.dylib'); // explicit path
+final api = WalletCoreAPI.fromLib(myLibrary);    // for Flutter plugins that own the load
 ```
 
-### Шаг 3: Устанавливаем зависимости wallet-core
+### HD wallets
 
-```bash
-# Скачивает и собирает: protobuf, googletest, libcheck
-export BOOST_ROOT=$(brew --prefix boost)
-tools/install-dependencies
+```dart
+// Sync — fast on desktop, blocks the isolate during PBKDF2 (~2.5s on iPhone).
+final w1 = api.hdWalletCreate(strength: 128);
+final w2 = api.hdWalletFromMnemonic('abandon abandon ... about');
+
+// Async — runs the heavy work on a native std::thread.
+final w3 = await api.hdWalletCreateAsync(strength: 256);
+final w4 = await api.hdWalletFromMnemonicAsync('abandon ...');
+
+w1.getAddressForCoin(TWCoinType.ethereum);
+w1.getPrivateKeyForCoin(TWCoinType.ethereum); // Uint8List
+w1.delete(); // free the native handle
 ```
 
-Это создаёт `build/local/` с protoc, gtest и другими инструментами.
+### Mnemonics
 
-### Шаг 4: Генерируем код
-
-Wallet-core использует кодогенерацию — protobuf, Rust bindgen, C typedef headers:
-
-```bash
-export PATH="$HOME/.cargo/bin:$PWD/build/local/bin:$PATH"
-export BOOST_ROOT=$(brew --prefix boost)
-
-# 1. Protobuf → C++ (основные .proto файлы)
-cd src && protoc -I=proto --cpp_out=proto proto/*.proto && cd ..
-
-# 2. Protobuf → C++ (блокчейн-специфичные .proto)
-find src -name "*.proto" -not -path "src/proto/*" | while read f; do
-  dir=$(dirname "$f")
-  protoc -I="$dir" --cpp_out="$dir" "$f"
-done
-
-# 3. Protobuf → C typedef headers (для include/TrustWalletCore/)
-PREFIX="$PWD/build/local"
-$PREFIX/bin/protoc -I=$PREFIX/include -I=src/proto \
-  --plugin=$PREFIX/bin/protoc-gen-c-typedef \
-  --c-typedef_out include/TrustWalletCore \
-  src/proto/*.proto
-
-# 4. Rust → C header (cbindgen)
-cd rust && cbindgen --crate wallet-core-rs \
-  --output ../src/rust/bindgen/WalletCoreRSBindgen.h && cd ..
-cp rust/target/release/libwallet_core_rs.a build/local/lib/
-
-# 5. C++ codegen (генерирует доп. хедеры)
-cd codegen-v2 && cargo run -- cpp && cd ..
+```dart
+api.mnemonicIsValid('abandon abandon ... about'); // bool
+api.mnemonicIsValidWord('abandon');               // bool
 ```
 
-### Шаг 5: Собираем статическую библиотеку
+### Addresses
 
-```bash
-cmake -H. -Bbuild -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DTW_UNITY_BUILD=ON \
-  -DCMAKE_C_FLAGS="-fvisibility=default" \
-  -DCMAKE_CXX_FLAGS="-fvisibility=default"
-
-make -Cbuild -j12 TrustWalletCore
+```dart
+api.addressIsValid('0x...', TWCoinType.ethereum);
+api.addressNormalize('0x...', TWCoinType.ethereum); // canonical form, or null
 ```
 
-Результат: `build/libTrustWalletCore.a` — статическая библиотека.
+### Signing transactions
 
-### Шаг 6: Проблема с visibility (и как мы её решили)
+`signTransaction` takes a serialized protobuf `SigningInput` and returns a serialized `SigningOutput`. The protobuf schemas live under [lib/src/proto](lib/src/proto). See [example/sign_ethereum.dart](example/sign_ethereum.dart) and [example/sign_ton.dart](example/sign_ton.dart) for end-to-end examples.
 
-**Проблема:** wallet-core компилируется с `__attribute__((visibility("hidden")))` на всех TW* функциях. Даже с `-fvisibility=default` в cmake, объектные файлы содержат `.hidden` маркер:
+```dart
+final output = api.signTransaction(serializedInput, TWCoinType.ethereum);
+```
+
+### Hashing
+
+```dart
+api.hashSHA256(bytes);
+api.hashSHA512(bytes);
+api.hashKeccak256(bytes);
+api.hashRIPEMD(bytes);
+api.hashSHA256SHA256(bytes);
+api.hashSHA256RIPEMD(bytes);
+```
+
+### Encrypted keystore
+
+```dart
+final stored = api.storedKeyImportHDWallet(
+  wallet.mnemonic, 'My Wallet', 'password', TWCoinType.ethereum,
+);
+
+stored.exportJSON();              // Uint8List — Ethereum keystore v3
+stored.store('/path/to/key.json');
+stored.decryptMnemonic('password');
+
+final loaded = api.storedKeyLoad('/path/to/key.json');
+loaded?.delete();
+stored.delete();
+```
+
+### TON helpers
+
+```dart
+api.tonAddressToUserFriendly(addr, bounceable: false);            // UQ...
+api.tonAddressToUserFriendly(addr, bounceable: true);             // EQ...
+api.tonAddressToUserFriendly(addr, bounceable: false, testnet: true); // 0Q...
+
+// `tonutils`-compatible mnemonic → ed25519 keypair (PBKDF2 100k iters,
+// runs on a background thread).
+final kp = await api.tonMnemonicToKeyPairAsync('word1 word2 ...');
+kp.publicKey;  // 32 bytes
+kp.privateKey; // 64 bytes — NaCl secret key (seed || pubkey)
+```
+
+### Ethereum message signing
+
+```dart
+api.ethSignMessage(privateKeyPtr, 'hello');             // EIP-191
+api.ethSignTypedMessage(privateKeyPtr, jsonEip712);     // EIP-712
+```
+
+### Coin metadata
+
+```dart
+api.coinName(TWCoinType.ethereum);          // "Ethereum"
+api.coinSymbol(TWCoinType.ethereum);        // "ETH"
+api.coinDecimals(TWCoinType.ethereum);      // 18
+api.coinID(TWCoinType.ethereum);            // "ethereum"
+api.coinTransactionURL(TWCoinType.ethereum, '0xabc...');
+```
+
+## Memory management
+
+Every `TW*` object backing a Dart wrapper is a native handle. The high-level wrappers (`HDWallet`, `StoredKey`, …) expose `.delete()` — call it when you are done. For one-shot string/bytes conversions the package uses scoped helpers (`TWStringWrapper.withString`, `TWDataWrapper.withBytes`) that free the temporary handle automatically.
+
+> Forgetting to call `.delete()` leaks native memory. The Dart GC does not see it.
+
+## Project layout
+
+```
+lib/
+├── redo_wallet_core.dart           ← package barrel — re-exports the public API
+├── libTrustWalletCore.dylib        ← bundled macOS binary
+└── src/
+    ├── core/                       ← idiomatic Dart wrappers
+    │   ├── tw_string.dart          ← String ↔ TWString*
+    │   ├── tw_data.dart            ← Uint8List ↔ TWData*
+    │   └── wallet_core_api.dart    ← WalletCoreAPI, HDWallet, StoredKey, TWCoinType
+    ├── ffi/                        ← raw FFI bindings (one file per TW module)
+    │   ├── tw_library.dart         ← DynamicLibrary loader
+    │   ├── tw_hash_ffi.dart
+    │   ├── tw_hd_wallet_ffi.dart
+    │   ├── tw_private_key_ffi.dart
+    │   ├── tw_any_address_ffi.dart
+    │   ├── tw_any_signer_ffi.dart
+    │   ├── tw_stored_key_ffi.dart
+    │   ├── tw_coin_config_ffi.dart
+    │   ├── tw_ethereum_msg_ffi.dart
+    │   ├── tw_ton_address_ffi.dart
+    │   ├── tw_ton_mnemonic_ffi.dart
+    │   └── ...
+    └── proto/                      ← generated protobuf messages for AnySigner
+example/
+├── full_demo.dart                  ← end-to-end tour
+├── sign_ethereum.dart
+├── sign_ton.dart
+├── show_address.dart
+└── wallet_core_example.dart
+native/
+└── tw_exports.c                    ← visibility wrappers (see below)
+scripts/
+├── build_dylib.sh                  ← rebuilds libTrustWalletCore.dylib
+└── gen_tw_exports.py               ← regenerates native/tw_exports.c
+```
+
+## How it works
+
+```
+Dart application
+       │
+       ▼
+WalletCoreAPI (lib/src/core/)              ← high-level Dart facade
+       │
+       ▼
+*FFI bindings (lib/src/ffi/)               ← lookupFunction for dartTW* symbols
+       │
+       ▼
+native/tw_exports.c                        ← thin wrappers with default visibility
+       │
+       ▼
+libTrustWalletCore.dylib
+       │
+       ├── libTrustWalletCore.a            ← C++ core (BIP32, secp256k1, ed25519, …)
+       ├── libTrezorCrypto.a               ← Trezor crypto primitives
+       ├── libwallet_core_rs.a             ← Rust modules (TON, Polkadot, …)
+       └── libprotobuf.a
+```
+
+### Why `dartTW*` wrappers?
+
+Trust Wallet Core is compiled with `__attribute__((visibility("hidden")))` on every `TW*` symbol. Even passing `-fvisibility=default` to CMake leaves the static archive's object files marked `.hidden`:
 
 ```bash
 $ objdump -t build/libTrustWalletCore.a | grep TWHashSHA256
 0000001524 g F __TEXT,__text .hidden _TWHashSHA256
-#                                    ^^^^^^^ — не видна в .dylib!
 ```
 
-`dart:ffi` может вызывать только **exported** (глобально видимые) символы из `.dylib`. TWString и TWData экспортируются (у них нет hidden), но все остальные TW* функции — скрыты.
-
-**Решение:** C-файл `tw_exports.c` — тонкие обёртки с `visibility("default")`:
+`dart:ffi` can only call **exported** symbols. The fix is a tiny C file ([native/tw_exports.c](native/tw_exports.c)) that re-exports each used symbol with default visibility under a `dartTW*` prefix:
 
 ```c
 #define EXPORT __attribute__((visibility("default")))
 
-// Вместо скрытого TWHashSHA256 экспортируем dartTWHashSHA256
 EXPORT TWData* dartTWHashSHA256(TWData* data) {
-    return TWHashSHA256(data);  // вызывает hidden функцию внутри .a
+    return TWHashSHA256(data);
 }
 ```
 
-Каждая обёртка — это один `call` instruction, overhead ~0.
+Each wrapper compiles to a single tail call — overhead is effectively zero. The `dartTW` prefix avoids clashes with the `tw_*` symbols already exported by the Rust side of wallet-core.
 
-**Почему префикс `dartTW`?** Rust-часть wallet-core уже использует `tw_` префикс для своих символов (например `tw_any_address_delete`). Чтобы избежать конфликтов, наши обёртки называются `dartTW*`.
+## Building the native library
 
-### Шаг 7: Собираем .dylib из всех частей
+You only need to do this if you change the upstream wallet-core, add new `TW*` symbols, or want to rebuild for a different host.
 
-```bash
-# Компилируем обёртку
-clang -c -fvisibility=default \
-  -I include -I src -I build/local/include \
-  build/tw_exports.c -o build/tw_exports.o
-
-# Линкуем всё в одну .dylib
-clang++ -shared -o build/libTrustWalletCore.dylib \
-  build/tw_exports.o \
-  -Wl,-force_load,build/libTrustWalletCore.a \
-  -Wl,-force_load,build/trezor-crypto/libTrezorCrypto.a \
-  -Wl,-force_load,build/local/lib/libprotobuf.a \
-  -Wl,-force_load,build/local/lib/libwallet_core_rs.a \
-  -lc++ -lz -framework Security -framework CoreFoundation \
-  -Wl,-undefined,dynamic_lookup
-```
-
-`-force_load` — загрузить ВСЕ объектные файлы из `.a` (иначе линкер выбросит "ненужные").
-
-`-undefined,dynamic_lookup` — несколько Monero-специфичных символов отсутствуют, подавляем ошибку.
-
-Проверяем что символы экспортируются:
+### Prerequisites
 
 ```bash
-$ nm -gU build/libTrustWalletCore.dylib | grep "dartTW" | wc -l
-37
+brew install boost ninja cmake
+cargo install cbindgen
 ```
 
-### Шаг 8: Копируем в Dart проект
+### One-time wallet-core setup
 
 ```bash
-cp build/libTrustWalletCore.dylib ../wallet_core/lib/
+cd /path/to/workspace
+git clone --depth 1 git@github.com:nvsces/wallet-core.git wallet-core-native
+cd wallet-core-native
+
+export BOOST_ROOT=$(brew --prefix boost)
+tools/install-dependencies      # builds protoc, gtest, libcheck into build/local/
+tools/generate-files            # protobuf, cbindgen, codegen-v2
+
+cmake -H. -Bbuild -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DTW_UNITY_BUILD=ON
+make -Cbuild -j12 TrustWalletCore
 ```
 
-### Шаг 9: Запускаем
+This produces the four static archives the Dart package links against:
+
+- `build/libTrustWalletCore.a`
+- `build/trezor-crypto/libTrezorCrypto.a`
+- `build/local/lib/libprotobuf.a`
+- `build/local/lib/libwallet_core_rs.a`
+
+### Rebuild the dylib for `redo_wallet_core`
 
 ```bash
-cd ../wallet_core
-dart run example/wallet_core_example.dart
+bash scripts/build_dylib.sh
 ```
 
-## Структура Dart-проекта
+The script:
 
-```
-lib/
-├── wallet_core.dart              ← экспорт всех модулей
-├── src/
-│   ├── ffi/                      ← сырые FFI биндинги
-│   │   ├── tw_library.dart       ← загрузка .dylib
-│   │   ├── tw_string_ffi.dart    ← TWString: Create/Delete/UTF8Bytes
-│   │   ├── tw_data_ffi.dart      ← TWData: Create/Delete/Bytes/Size
-│   │   ├── tw_hash_ffi.dart      ← SHA256/Keccak256/RIPEMD/Blake2b
-│   │   ├── tw_mnemonic_ffi.dart  ← IsValid/IsValidWord/Suggest
-│   │   ├── tw_hd_wallet_ffi.dart ← Create/Mnemonic/Seed/GetKey/GetAddress
-│   │   └── tw_private_key_ffi.dart ← Create/Sign/GetPublicKey
-│   └── core/                     ← удобные Dart-обёртки
-│       ├── tw_string.dart        ← TWStringWrapper (String ↔ TWString*)
-│       ├── tw_data.dart          ← TWDataWrapper (Uint8List ↔ TWData*)
-│       └── wallet_core_api.dart  ← WalletCoreAPI, HDWallet, TWCoinType
-example/
-└── wallet_core_example.dart      ← рабочий пример
-```
+1. Regenerates `native/tw_exports.c` from the `dartTW*` symbols actually referenced by the Dart bindings (`scripts/gen_tw_exports.py`).
+2. Compiles `tw_exports.c` with `-fvisibility=default`.
+3. Links it against the four static archives via `-Wl,-force_load` to produce `build/libTrustWalletCore.dylib`.
+4. Copies the dylib into every consumer (`redo_wallet_core/lib/`, `redo_wallet_provider/lib/`, `redo_wallet_flutter/macos/Libs/`, …).
+5. Verifies that the async wrappers (`dartTWHDWalletCreateAsync`, `dartTWTONMnemonicToKeyPairAsync`, …) are exported.
 
-## Как устроены FFI биндинги
+The iOS `.xcframework` is built separately — see `wallet-core-native/build-ios.sh`.
 
-Все TW* типы — **opaque pointers** (`Pointer<Void>` в Dart):
+## Roadmap
 
-```dart
-// C:  TWString* TWStringCreateWithUTF8Bytes(const char* bytes)
-// Dart FFI:
-typedef TWStringCreateNative = Pointer<Void> Function(Pointer<Utf8>);
-typedef TWStringCreateDart   = Pointer<Void> Function(Pointer<Utf8>);
+- [ ] Pre-built `.a`/`.so`/`.xcframework` shipped via the Flutter plugin.
+- [ ] Linux / Windows host binaries.
+- [ ] More chain-specific helpers (Solana message signing, Bitcoin PSBT, …).
+- [ ] Wider test coverage of the high-level Dart API.
 
-final create = lib.lookupFunction<TWStringCreateNative, TWStringCreateDart>(
-  'TWStringCreateWithUTF8Bytes',
-);
-```
+## License
 
-**Управление памятью** — ручное, через Create/Delete:
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
-```dart
-final twStr = TWStringWrapper.fromString(ffi, 'hello');
-try {
-  // используем twStr.pointer
-} finally {
-  twStr.delete();  // ОБЯЗАТЕЛЬНО — иначе утечка нативной памяти
-}
-
-// Или через хелпер:
-TWStringWrapper.withString(ffi, 'hello', (ptr) {
-  // автоматически удалится после callback
-});
-```
-
-## Что дальше
-
-- [ ] TWAnyAddress — валидация адресов
-- [ ] TWAnySigner — подпись транзакций (protobuf)
-- [ ] TWEthereumAbi — вызовы смарт-контрактов
-- [ ] Тесты
-- [ ] Flutter plugin (iOS/Android с предсобранными .a/.so)
+This package contains Dart bindings to **Trust Wallet Core**, which is also Apache 2.0 licensed. Copyright 2017 Trust Wallet. See the upstream [LICENSE](https://github.com/trustwallet/wallet-core/blob/master/LICENSE) and [LICENSE-3RD-PARTY.txt](https://github.com/trustwallet/wallet-core/blob/master/LICENSE-3RD-PARTY.txt) for details on bundled third-party code (trezor-crypto, libsecp256k1, protobuf, …).

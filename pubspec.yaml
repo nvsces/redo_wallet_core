@@ -1,6 +1,7 @@
 name: redo_wallet_core
-description: Dart FFI bindings to Trust Wallet Core C++ library.
+description: Dart FFI bindings to Trust Wallet Core — HD wallets, signing, hashing and 130+ blockchains.
 version: 0.1.0
+# SPDX-License-Identifier: Apache-2.0
 
 environment:
   sdk: ^3.10.4
